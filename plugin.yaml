@@ -1,0 +1,41 @@
+name: polyglot
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+description: "Live interpreter for Hermes group chats: every member reads the group (text and voice notes) in their own language. Sarvam AI optional for Indian languages."
+author: Subramanyarao11
+license: MIT
+homepage: https://github.com/Subramanyarao11/hermes-polyglot
+requires_hermes: ">=0.23.0"
+tags: [gateway, telegram, discord, translation, voice, india]
+provides_tools: []
+provides_hooks:
+  - pre_gateway_dispatch
+provides_middleware: []
+config_schema:
+  sarvam_api_key:
+    type: secret
+    env: SARVAM_API_KEY
+    label: "Sarvam AI API key (optional)"
+    description: "Adds Sarvam AI for Indian languages and voice notes (22 Indian languages, code-mixed speech). Without it, your Hermes model translates everything."
+  sarvam_mode:
+    type: str
+    choices: [modern-colloquial, formal, classic-colloquial, code-mixed]
+    default: modern-colloquial
+    label: "Sarvam translation style"
+    description: "How Sarvam's Mayura model phrases translations between the 11 languages it covers."
+  auto_language:
+    type: bool
+    default: true
+    label: "Learn languages automatically"
+    description: "Set each member's reading language from the first message they write, so nobody has to send /lang. They can still change it with /lang."
+  voice_notes:
+    type: bool
+    default: true
+    label: "Translate voice notes"
+    description: "Transcribe voice notes (with Sarvam if set, otherwise Hermes's speech-to-text) and translate them."
+  wake_word:
+    type: str
+    default: hermes
+    label: "Wake word"
+    description: "Messages that start with this word (or @mention the bot) go to Hermes as a question instead of being translated."
