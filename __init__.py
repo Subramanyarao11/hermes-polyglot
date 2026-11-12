@@ -1,20 +1,21 @@
 """Polyglot: a live interpreter for Hermes group chats.
 
-Add Hermes to a Telegram / Discord / Slack / WhatsApp group, run ``/polyglot on``, and each member
-types ``/lang <their language>`` once. From then on every message (and voice note) is translated for
-everyone else in the group, in their own language, as a reply to the original message. Hermes still
-answers as an assistant when someone addresses it ("hermes, ..." or an @mention of the bot).
+Add Hermes to a Telegram / Discord / Slack / WhatsApp group and run ``/polyglot on``. Each member's
+reading language is learned from their first message (or set with ``/lang``). From then on every message
+from someone Hermes admits is translated for everyone else in the group, in their own language. Hermes
+still answers as an assistant when someone addresses it ("hermes, ..." or an @mention of the bot).
 
-Surfaces: the ``pre_gateway_dispatch`` hook (sees each group message before the agent and replies on
-the side channel, so translation never costs an agent turn), two slash commands, a registered
-auxiliary model slot (``auxiliary.polyglot_translate``) and ``ctx.llm`` for the translation call.
+Surfaces: the ``post_gateway_admission`` hook (runs after Hermes's authorization; it consumes each
+interpreted group message and returns the translation as the reply, so translation never costs an agent
+turn), two slash commands, a registered auxiliary model slot (``auxiliary.polyglot_translate``) and
+``ctx.llm`` for the translation call.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
+from types import SimpleNamespace
 from typing import Any, Optional
 
 from . import formatting
@@ -27,8 +28,6 @@ logger = logging.getLogger(__name__)
 ENGLISH = parse("english")
 AUTO_LANGUAGE_MIN_LETTERS = 8  # shorter messages ("ok", "hi all") say too little about someone's language
 GROUP_CHAT_TYPES = frozenset({"group", "channel", "thread", "forum", "supergroup"})
-_LANG_CMD = re.compile(r"^/(lang|language)(?:@[\w.]+)?(?:\s+(.*))?$", re.I | re.S)
-_POLYGLOT_CMD = re.compile(r"^/polyglot(?:@[\w.]+)?\b", re.I)
 _BOT_MENTION = re.compile(r"(?<![\w@])@\w{2,}bot\b|<@!?\d+>", re.I)
 _LETTER = re.compile(r"[^\W\d_]", re.UNICODE)
 _URL = re.compile(r"https?://\S+")
@@ -69,40 +68,34 @@ class Polyglot:
         return Interpreter(ModelTranslator(self.ctx.llm, use_task=self.use_task), self._sarvam())
 
     # ---- gateway hook -----------------------------------------------------------------------------
-    async def on_gateway_dispatch(self, event: Any = None, gateway: Any = None, **_: Any) -> Optional[dict]:
-        source = getattr(event, "source", None)
-        if source is None or getattr(event, "internal", False) or getattr(source, "is_bot", False):
+    async def on_admitted_message(self, session_key: str = "", platform: str = "", source: Any = None,
+                                  message_id: Any = None, text: str = "", **_: Any) -> Optional[dict]:
+        """``post_gateway_admission``: runs only for messages Hermes already admitted (authorized
+        senders, after slash commands were dispatched), so nobody Hermes would refuse can spend the
+        owner's model or Sarvam key, or write to the roster."""
+        src = _source(source, platform)
+        if src is None or src.is_bot:
             return None
-        if str(getattr(source, "chat_type", "") or "").lower() not in GROUP_CHAT_TYPES:
+        if str(src.chat_type or "").lower() not in GROUP_CHAT_TYPES:
             return None
-        platform = _platform_name(source)
-        key = chat_key(platform, str(source.chat_id))
+        key = chat_key(_platform_name(src), str(src.chat_id))
         if not self.store.is_enabled(key):
             return None  # Polyglot only acts in chats an authorized user switched on
 
-        text = (getattr(event, "text", "") or "").strip()
-        if _POLYGLOT_CMD.match(text):
-            return None  # /polyglot goes through Hermes's normal authorization
-        lang_cmd = _LANG_CMD.match(text)
-        if lang_cmd:
-            # Any member may choose their own reading language; it only affects what they read.
-            reply = self.set_language(key, source, (lang_cmd.group(2) or "").strip())
-            await _send(gateway, source, reply, reply_to=getattr(event, "message_id", None))
-            return {"action": "skip", "reason": "polyglot-lang"}
+        text = (text or "").strip()
         if text.startswith("/") or self._addressed_to_assistant(text):
-            return None  # commands and questions for Hermes take the normal path
+            return None  # commands and questions for Hermes take the normal agent turn
 
         try:
-            reply = await self._interpret(key, source, event, text)
+            reply = await self._interpret(key, src, text)
         except TranslationError as exc:
             logger.warning("polyglot: translation failed in %s: %s", key, exc)
-            return {"action": "skip", "reason": "polyglot-failed"}
-        except Exception:  # noqa: BLE001 - a broken translation must never stop the gateway
+            return {"action": "handled"}
+        except Exception:  # noqa: BLE001 - fail closed: a broken translation never becomes an agent turn
             logger.exception("polyglot: unexpected error in %s", key)
-            return {"action": "skip", "reason": "polyglot-error"}
-        if reply:
-            await _send(gateway, source, reply, reply_to=getattr(event, "message_id", None))
-        return {"action": "skip", "reason": "polyglot-interpreted"}
+            return {"action": "handled"}
+        # Group chatter in an interpreted chat never becomes an agent turn, translated or not.
+        return {"action": "handled", "reply": reply} if reply else {"action": "handled"}
 
     def _addressed_to_assistant(self, text: str) -> bool:
         if _BOT_MENTION.search(text):
@@ -113,7 +106,7 @@ class Polyglot:
         head = text.casefold()
         return head == wake or (head.startswith(wake) and not head[len(wake):len(wake) + 1].isalnum())
 
-    async def _interpret(self, key: str, source: Any, event: Any, text: str) -> Optional[str]:
+    async def _interpret(self, key: str, source: Any, text: str) -> Optional[str]:
         user_id = str(getattr(source, "user_id", "") or "")
         targets = self.store.languages(key)
         speaker = self.store.member_language(key, user_id)
@@ -122,14 +115,6 @@ class Polyglot:
         newcomer = speaker is None and bool(user_id) and bool(self._setting("auto_language", True))
         if not targets and not newcomer:
             return None
-        transcript: Optional[str] = None
-        audio = _voice_path(event)
-        if audio and bool(self._setting("voice_notes", True)):
-            transcript, heard = await self._transcribe(audio)
-            if not transcript:
-                return None
-            speaker = heard or speaker
-            text = f"{transcript}\n{text}".strip() if text else transcript
         if not _worth_translating(text):
             return None
         learn = newcomer and _letters(text) >= AUTO_LANGUAGE_MIN_LETTERS
@@ -137,7 +122,7 @@ class Polyglot:
             return None
         # With nobody to translate for yet, the call is still made (into English) to detect the language.
         result = await self.interpreter().translate(text, targets or [ENGLISH], speaker_hint=speaker)
-        reply = formatting.render(result, targets, transcript=transcript)
+        reply = formatting.render(result, targets)
         if learn and result.source is not None:
             name = str(getattr(source, "user_name", "") or "you")
             try:
@@ -146,22 +131,6 @@ class Polyglot:
                 return reply
             return "\n".join(filter(None, [reply, formatting.learned(name, result.source)]))
         return reply
-
-    async def _transcribe(self, path: str) -> tuple[Optional[str], Optional[Language]]:
-        sarvam = self._sarvam()
-        if sarvam is not None:
-            try:
-                return await asyncio.to_thread(sarvam.transcribe, path)
-            except TranslationError as exc:
-                logger.info("polyglot: Sarvam speech-to-text failed, trying Hermes STT: %s", exc)
-        try:  # Hermes's own configured speech-to-text
-            from tools.transcription_tools import transcribe_audio
-        except ImportError:
-            return None, None
-        result = await asyncio.to_thread(transcribe_audio, path, None, "gateway")
-        if isinstance(result, dict) and result.get("success"):
-            return (str(result.get("transcript") or "").strip() or None), None
-        return None, None
 
     # ---- commands ---------------------------------------------------------------------------------
     def set_language(self, key: str, source: Any, args: str) -> str:
@@ -225,12 +194,14 @@ def _platform_name(source: Any) -> str:
     return str(getattr(platform, "value", platform) or "unknown")
 
 
-def _voice_path(event: Any) -> Optional[str]:
-    kind = getattr(getattr(event, "message_type", None), "value", "")
-    urls = list(getattr(event, "media_urls", None) or [])
-    if kind in {"voice", "audio"} and urls and isinstance(urls[0], str) and not urls[0].startswith("http"):
-        return urls[0]
-    return None
+def _source(source: Any, platform: str) -> Optional[SimpleNamespace]:
+    """The hook's ``source`` is a plain dict snapshot (``SessionSource.to_dict()``)."""
+    if not isinstance(source, dict) or not source.get("chat_id"):
+        return None
+    return SimpleNamespace(
+        platform=str(source.get("platform") or platform or "unknown"), chat_id=str(source["chat_id"]),
+        chat_type=str(source.get("chat_type") or "dm"), user_id=source.get("user_id"),
+        user_name=source.get("user_name"), thread_id=source.get("thread_id"), is_bot=bool(source.get("is_bot")))
 
 
 def _letters(text: str) -> int:
@@ -240,19 +211,6 @@ def _letters(text: str) -> int:
 def _worth_translating(text: str) -> bool:
     """Skip messages with nothing to translate: emoji, links, "ok", "+1"."""
     return _letters(text) >= 2
-
-
-async def _send(gateway: Any, source: Any, text: str, *, reply_to: Optional[str]) -> None:
-    adapters = getattr(gateway, "adapters", None) or {}
-    adapter = adapters.get(getattr(source, "platform", None))
-    if adapter is None:
-        logger.warning("polyglot: no adapter for %s; cannot reply", _platform_name(source))
-        return
-    metadata = {"thread_id": source.thread_id} if getattr(source, "thread_id", None) else None
-    try:
-        await adapter.send(str(source.chat_id), text, reply_to=reply_to, metadata=metadata)
-    except Exception:  # noqa: BLE001 - delivery problems are logged, never raised into dispatch
-        logger.exception("polyglot: sending the translation failed")
 
 
 def register(ctx: Any) -> None:
@@ -269,7 +227,7 @@ def register(ctx: Any) -> None:
             plugin.use_task = True
         except Exception:  # noqa: BLE001 - older Hermes: fall back to the main model
             logger.info("polyglot: auxiliary task slot unavailable; translating with the main model")
-    ctx.register_hook("pre_gateway_dispatch", plugin.on_gateway_dispatch)
+    ctx.register_hook("post_gateway_admission", plugin.on_admitted_message)
     ctx.register_command("polyglot", handler=plugin.polyglot_command,
                          description="Live interpreter for this group: /polyglot on | off | status | help",
                          args_hint="on|off|status|help")

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,11 +27,6 @@ from polyglot import languages, store, translate  # noqa: E402
 
 class Platform(Enum):
     TELEGRAM = "telegram"
-
-
-class MessageType(Enum):
-    TEXT = "text"
-    VOICE = "voice"
 
 
 class FakeState:
@@ -74,17 +69,6 @@ class FakeSarvam:
         self.translated.append((source.code, target.code))
         return f"<sarvam {target.code}> {text}"
 
-    def transcribe(self, path: str):
-        return "ನಮಸ್ಕಾರ, ಊಟ ಆಯ್ತಾ?", languages.by_sarvam_code("kn-IN")
-
-
-class FakeAdapter:
-    def __init__(self) -> None:
-        self.sent: list[dict[str, Any]] = []
-
-    async def send(self, chat_id: str, content: str, reply_to=None, metadata=None):
-        self.sent.append({"chat_id": chat_id, "content": content, "reply_to": reply_to, "metadata": metadata})
-
 
 @dataclass
 class Source:
@@ -97,23 +81,27 @@ class Source:
     is_bot: bool = False
 
 
-@dataclass
-class Event:
-    text: str
-    source: Source
-    message_id: str = "m1"
-    internal: bool = False
-    message_type: MessageType = MessageType.TEXT
-    media_urls: list = field(default_factory=list)
-
-
 def make_plugin(llm: Optional[FakeLlm] = None, sarvam: Optional[FakeSarvam] = None):
     ctx = SimpleNamespace(state=FakeState(), llm=llm or FakeLlm(), get_config=lambda key, default=None: default)
     plugin = polyglot.Polyglot(ctx)
     plugin._sarvam = lambda: sarvam  # type: ignore[method-assign]
-    adapter = FakeAdapter()
-    gateway = SimpleNamespace(adapters={Platform.TELEGRAM: adapter})
-    return plugin, gateway, adapter
+    return plugin
+
+
+def admit(plugin, text: str, src: "Source", message_id: str = "m1"):
+    """Call the hook the way the gateway does: keyword payload, ``source`` as a plain dict."""
+    snapshot = {"platform": src.platform.value, "chat_id": src.chat_id, "chat_type": src.chat_type,
+                "user_id": src.user_id, "user_name": src.user_name}
+    if src.thread_id:
+        snapshot["thread_id"] = src.thread_id
+    if src.is_bot:
+        snapshot["is_bot"] = True
+    return run(plugin.on_admitted_message(session_key="k", platform=src.platform.value, source=snapshot,
+                                          message_id=message_id, text=text))
+
+
+def reply(out):
+    return (out or {}).get("reply") or ""
 
 
 def run(coro):
@@ -125,10 +113,10 @@ RAVI = Source("2", "Ravi")
 MARIA = Source("3", "Maria")
 
 
-def setup_chat(plugin, gateway):
+def setup_chat(plugin):
     run(plugin.polyglot_command("on", source=ASHA))
     for src, lang in ((ASHA, "kannada"), (RAVI, "english"), (MARIA, "español")):
-        run(plugin.on_gateway_dispatch(Event(f"/lang {lang}", src), gateway))
+        run(plugin.lang_command(lang, source=src))
 
 
 # ---- languages ----------------------------------------------------------------------------------------
@@ -173,160 +161,157 @@ def test_store_roundtrip_and_distinct_languages():
 
 # ---- gateway hook ------------------------------------------------------------------------------------
 
+def test_registers_the_post_admission_hook_only():
+    hooks, commands = [], []
+    ctx = SimpleNamespace(state=FakeState(), llm=FakeLlm(), get_config=lambda key, default=None: default,
+                          register_hook=lambda name, fn: hooks.append(name),
+                          register_command=lambda name, **kw: commands.append(name))
+    polyglot.register(ctx)
+    assert hooks == ["post_gateway_admission"] and commands == ["polyglot", "lang"]
+
+
 def test_does_nothing_until_enabled():
-    plugin, gateway, adapter = make_plugin()
-    assert run(plugin.on_gateway_dispatch(Event("hello all", ASHA), gateway)) is None
-    assert adapter.sent == []
+    plugin = make_plugin()
+    assert admit(plugin, "hello all", ASHA) is None
 
 
-def test_ignores_direct_messages():
-    plugin, gateway, adapter = make_plugin()
-    dm = Source("1", "Asha", chat_type="dm")
+def test_ignores_direct_messages_bots_and_bad_payloads():
+    plugin = make_plugin()
     run(plugin.polyglot_command("on", source=ASHA))
-    assert run(plugin.on_gateway_dispatch(Event("hello", dm), gateway)) is None
+    assert admit(plugin, "hello", Source("1", "Asha", chat_type="dm")) is None
+    assert admit(plugin, "hello there", Source("9", "Relay", is_bot=True)) is None
+    assert run(plugin.on_admitted_message(source=None, text="hello")) is None
 
 
-def test_lang_command_is_handled_before_auth_in_enabled_chats():
-    plugin, gateway, adapter = make_plugin()
+def test_lang_command_sets_only_the_senders_language():
+    plugin = make_plugin()
     run(plugin.polyglot_command("on", source=ASHA))
-    out = run(plugin.on_gateway_dispatch(Event("/lang@hermes_bot kannada", RAVI), gateway))
-    assert out == {"action": "skip", "reason": "polyglot-lang"}
-    assert "ಕನ್ನಡ" in adapter.sent[-1]["content"]
+    assert "ಕನ್ನಡ" in run(plugin.lang_command("kannada", source=RAVI))
+    key = store.chat_key("telegram", "-100")
+    assert plugin.store.member_language(key, "2").code == "kn"
+    assert plugin.store.member_language(key, "1") is None
 
 
 def test_translates_for_every_other_language_and_skips_agent_turn():
     llm = FakeLlm(source_language="English")
-    plugin, gateway, adapter = make_plugin(llm)
-    setup_chat(plugin, gateway)
-    adapter.sent.clear()
-    out = run(plugin.on_gateway_dispatch(Event("Dinner at 8?", RAVI, message_id="42"), gateway))
-    assert out["action"] == "skip"
-    reply = adapter.sent[-1]
-    assert reply["reply_to"] == "42"
-    assert "[kn] Dinner at 8?" in reply["content"] and "[es] Dinner at 8?" in reply["content"]
-    assert "[en]" not in reply["content"]  # nobody needs English → English
+    plugin = make_plugin(llm)
+    setup_chat(plugin)
+    out = admit(plugin, "Dinner at 8?", RAVI, message_id="42")
+    assert out["action"] == "handled"
+    assert "[kn] Dinner at 8?" in out["reply"] and "[es] Dinner at 8?" in out["reply"]
+    assert "[en]" not in out["reply"]  # nobody needs English → English
     assert "task" not in llm.calls[-1]  # no aux slot registered in this fake ctx → main model
     plugin.use_task = True
-    run(plugin.on_gateway_dispatch(Event("See you soon", RAVI), gateway))
+    admit(plugin, "See you soon", RAVI)
     assert llm.calls[-1]["task"] == translate.AUX_TASK
 
 
 def test_declared_language_is_only_a_hint():
     """Asha reads Kannada but writes in English: Kannada readers must still get a translation."""
-    llm = FakeLlm(source_language="English")
-    plugin, gateway, adapter = make_plugin(llm)
-    setup_chat(plugin, gateway)
-    run(plugin.on_gateway_dispatch(Event("I'm running late", ASHA), gateway))
-    assert "[kn] I'm running late" in adapter.sent[-1]["content"]
+    plugin = make_plugin(FakeLlm(source_language="English"))
+    setup_chat(plugin)
+    assert "[kn] I'm running late" in reply(admit(plugin, "I'm running late", ASHA))
 
 
 def test_wake_word_and_mentions_go_to_hermes():
-    plugin, gateway, adapter = make_plugin()
-    setup_chat(plugin, gateway)
+    plugin = make_plugin()
+    setup_chat(plugin)
     for text in ("hermes, what's the weather?", "Hermes: book a table", "@hermes_bot summarise this"):
-        assert run(plugin.on_gateway_dispatch(Event(text, RAVI), gateway)) is None
-    assert run(plugin.on_gateway_dispatch(Event("hermeneutics is fun", RAVI), gateway))["action"] == "skip"
+        assert admit(plugin, text, RAVI) is None
+    assert admit(plugin, "hermeneutics is fun", RAVI)["action"] == "handled"
 
 
-def test_other_slash_commands_pass_through():
-    plugin, gateway, _ = make_plugin()
-    setup_chat(plugin, gateway)
-    assert run(plugin.on_gateway_dispatch(Event("/polyglot off", ASHA), gateway)) is None
-    assert run(plugin.on_gateway_dispatch(Event("/help", ASHA), gateway)) is None
+def test_slash_commands_pass_through():
+    plugin = make_plugin()
+    setup_chat(plugin)
+    assert admit(plugin, "/polyglot off", ASHA) is None
+    assert admit(plugin, "/help", ASHA) is None
 
 
-def test_emoji_and_links_are_not_translated():
+def test_emoji_links_and_empty_messages_are_consumed_silently():
     llm = FakeLlm()
-    plugin, gateway, adapter = make_plugin(llm)
-    setup_chat(plugin, gateway)
-    adapter.sent.clear()
-    for text in ("😂😂", "+1", "https://example.com/x"):
-        assert run(plugin.on_gateway_dispatch(Event(text, RAVI), gateway))["action"] == "skip"
-    assert adapter.sent == [] and llm.calls == []
+    plugin = make_plugin(llm)
+    setup_chat(plugin)
+    for text in ("😂😂", "+1", "https://example.com/x", ""):
+        assert admit(plugin, text, RAVI) == {"action": "handled"}
+    assert llm.calls == []
 
 
 def test_sarvam_handles_indian_pairs_and_model_handles_the_rest():
     llm, sarvam = FakeLlm(source_language="Kannada"), FakeSarvam(detected="kn-IN")
-    plugin, gateway, adapter = make_plugin(llm, sarvam)
-    setup_chat(plugin, gateway)
+    plugin = make_plugin(llm, sarvam)
+    setup_chat(plugin)
     llm.calls.clear()
-    run(plugin.on_gateway_dispatch(Event("ಊಟ ಆಯ್ತಾ?", ASHA), gateway))
-    content = adapter.sent[-1]["content"]
+    content = reply(admit(plugin, "ಊಟ ಆಯ್ತಾ?", ASHA))
     assert sarvam.translated == [("kn", "en")]
     assert "<sarvam en>" in content and "[es]" in content and "[kn]" not in content
     assert list(llm.calls[-1]["json_schema"]["properties"]["translations"]["properties"]) == ["es"]
 
 
-def test_voice_note_is_transcribed_then_translated():
-    llm, sarvam = FakeLlm(), FakeSarvam(detected="kn-IN")
-    plugin, gateway, adapter = make_plugin(llm, sarvam)
-    setup_chat(plugin, gateway)
-    voice = Event("", ASHA, message_type=MessageType.VOICE, media_urls=["/tmp/v.ogg"])
-    run(plugin.on_gateway_dispatch(voice, gateway))
-    content = adapter.sent[-1]["content"]
-    assert content.startswith("🎙 ನಮಸ್ಕಾರ") and "<sarvam en>" in content
-
-
-def test_translation_failure_is_silent_and_never_raises():
+def test_translation_failure_is_silent_and_never_becomes_an_agent_turn():
     class Broken(FakeLlm):
         async def acomplete_structured(self, **kwargs):
             raise translate.TranslationError("provider down")
-    plugin, gateway, adapter = make_plugin(Broken())
-    setup_chat(plugin, gateway)
-    adapter.sent.clear()
-    assert run(plugin.on_gateway_dispatch(Event("hello there", RAVI), gateway))["reason"] == "polyglot-failed"
-    assert adapter.sent == []
+    plugin = make_plugin(Broken())
+    setup_chat(plugin)
+    assert admit(plugin, "hello there", RAVI) == {"action": "handled"}
 
 
 def test_polyglot_command_in_dm_explains():
-    plugin, _, _ = make_plugin()
+    plugin = make_plugin()
     assert "group" in run(plugin.polyglot_command("on", source=Source("1", "Asha", chat_type="dm")))
+
+
+def test_status_explains_access_without_widening_it():
+    plugin = make_plugin()
+    run(plugin.polyglot_command("on", source=ASHA))
+    status = run(plugin.polyglot_command("status", source=ASHA))
+    assert "Only messages from people Hermes admits are translated" in status
+    assert "TELEGRAM_GROUP_ALLOWED_USERS" in status and "TELEGRAM_GROUP_ALLOWED_CHATS" not in status
 
 
 # ---- learning languages automatically ------------------------------------------------------------------
 
 def test_first_message_sets_the_senders_language_without_any_command():
     llm = FakeLlm(source_language="English")
-    plugin, gateway, adapter = make_plugin(llm)
+    plugin = make_plugin(llm)
     run(plugin.polyglot_command("on", source=RAVI))
     key = store.chat_key("telegram", "-100")
 
-    out = run(plugin.on_gateway_dispatch(Event("Is everyone coming tomorrow?", RAVI), gateway))
-    assert out["action"] == "skip"
+    out = admit(plugin, "Is everyone coming tomorrow?", RAVI)
+    assert out["action"] == "handled"
     assert plugin.store.member_language(key, "2").code == "en"
-    first = adapter.sent[-1]["content"]
+    first = out["reply"]
     assert first.startswith("👋 Ravi") and "English" in first and "🌐" not in first  # nobody to translate for yet
 
     llm.source_language = "Kannada"
-    run(plugin.on_gateway_dispatch(Event("ನಾಳೆ ಹಬ್ಬಕ್ಕೆ ಎಲ್ಲರೂ ಬರ್ತೀರಾ?", ASHA), gateway))
+    second = reply(admit(plugin, "ನಾಳೆ ಹಬ್ಬಕ್ಕೆ ಎಲ್ಲರೂ ಬರ್ತೀರಾ?", ASHA))
     assert plugin.store.member_language(key, "1").code == "kn"
-    second = adapter.sent[-1]["content"]
     assert "[en] ನಾಳೆ" in second and "👋 Asha" in second and "ಕನ್ನಡ" in second
 
     llm.source_language = "English"
-    run(plugin.on_gateway_dispatch(Event("Yes, landing at six", RAVI), gateway))
-    third = adapter.sent[-1]["content"]
+    third = reply(admit(plugin, "Yes, landing at six", RAVI))
     assert "[kn] Yes, landing at six" in third and "👋" not in third  # the note is shown only once
 
 
 def test_short_first_messages_do_not_decide_a_language():
     llm = FakeLlm()
-    plugin, gateway, adapter = make_plugin(llm)
+    plugin = make_plugin(llm)
     run(plugin.polyglot_command("on", source=RAVI))
-    run(plugin.on_gateway_dispatch(Event("hi all", RAVI), gateway))
+    assert admit(plugin, "hi all", RAVI) == {"action": "handled"}
     assert plugin.store.member_language(store.chat_key("telegram", "-100"), "2") is None
-    assert adapter.sent == [] and llm.calls == []
+    assert llm.calls == []
 
 
 def test_automatic_languages_can_be_switched_off():
     llm = FakeLlm()
-    plugin, gateway, adapter = make_plugin(llm)
+    plugin = make_plugin(llm)
     plugin.ctx.get_config = lambda key, default=None: False if key == "auto_language" else default
     run(plugin.polyglot_command("on", source=RAVI))
-    run(plugin.on_gateway_dispatch(Event("Is everyone coming tomorrow?", RAVI), gateway))
-    assert adapter.sent == [] and llm.calls == []
+    assert admit(plugin, "Is everyone coming tomorrow?", RAVI) == {"action": "handled"}
+    assert llm.calls == []
 
 
 def test_polyglot_status_when_off_says_how_to_start():
-    plugin, _, _ = make_plugin()
+    plugin = make_plugin()
     assert "/polyglot on" in run(plugin.polyglot_command("", source=RAVI))

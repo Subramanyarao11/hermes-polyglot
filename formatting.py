@@ -9,8 +9,7 @@ from .translate import Translation
 
 WELCOME = (
     "🌐 Polyglot is on. Just chat as usual, in any language.\n"
-    "I learn each person's language from their first message and translate the chat for everyone else. "
-    "Voice notes work too.\n"
+    "I learn each person's language from their first message and translate the chat for everyone else.\n"
     "• Prefer another language? Send /lang and its name, e.g. /lang hindi\n"
     "• To ask me something, start with “hermes,”"
 )
@@ -26,19 +25,12 @@ HELP = (
 )
 
 
-def render(result: Translation, targets: Sequence[Language], *, transcript: Optional[str] = None) -> Optional[str]:
+def render(result: Translation, targets: Sequence[Language]) -> Optional[str]:
     """One reply per message: a line per language that needed a translation, in roster order."""
-    lines: list[str] = []
-    if transcript:
-        lines.append(f"🎙 {transcript}")
     rendered = [(lang, result.texts[lang.code]) for lang in targets if result.texts.get(lang.code)]
     if not rendered:
-        return "\n".join(lines) if lines else None
-    if len(rendered) == 1 and not transcript:
-        lang, text = rendered[0]
-        return f"🌐 {lang.native}: {text}"
-    lines.extend(f"🌐 {lang.native}: {text}" for lang, text in rendered)
-    return "\n".join(lines)
+        return None
+    return "\n".join(f"🌐 {lang.native}: {text}" for lang, text in rendered)
 
 
 def roster(members: dict[str, Any], mine: Optional[Language]) -> str:
@@ -55,14 +47,14 @@ def roster(members: dict[str, Any], mine: Optional[Language]) -> str:
 
 
 def access_hint(platform: str, chat_id: str) -> str:
-    """Hermes drops group messages from people who are not allowed to use it before any plugin sees
-    them. Tell the admin how to let this group's members through."""
+    """Only people Hermes admits are translated. Point the admin at the gateway's own allowlists."""
     if platform != "telegram":
-        return ("\n\nIf other members' messages are not translated, allow this chat's members in your "
-                "Hermes gateway settings.")
-    return ("\n\nIf other members' messages are not translated, Hermes is ignoring them because they are "
-            f"not Hermes users. Allow this group: add TELEGRAM_GROUP_ALLOWED_CHATS={chat_id} to Hermes's "
-            ".env and restart the gateway. Every member of the group can then also talk to Hermes here.")
+        return ("\n\nOnly messages from people Hermes admits are translated. To include another member, "
+                "add them to your gateway's allowed users (see the Hermes messaging docs for this platform).")
+    return ("\n\nOnly messages from people Hermes admits are translated. To include another member, add "
+            "their Telegram user ID to TELEGRAM_GROUP_ALLOWED_USERS (group-only access) or "
+            "TELEGRAM_ALLOWED_USERS in Hermes's .env and restart the gateway. Admitted members can also "
+            "talk to Hermes here, so only add people you trust.")
 
 
 def learned(name: str, lang: Language) -> str:

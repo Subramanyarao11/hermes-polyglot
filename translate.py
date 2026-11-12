@@ -1,8 +1,8 @@
-"""Translation and speech-to-text backends.
+"""Translation backends.
 
 * ``ModelTranslator`` uses the user's own Hermes model through ``ctx.llm`` (no extra keys, any language).
-* ``SarvamClient`` calls Sarvam AI (api.sarvam.ai) for Indian languages and voice notes when the user
-  has added a Sarvam key. It is optional; everything falls back to the user's model.
+* ``SarvamClient`` calls Sarvam AI (api.sarvam.ai) for Indian languages when the user has added a
+  Sarvam key. It is optional; everything falls back to the user's model.
 """
 
 from __future__ import annotations
@@ -10,10 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import mimetypes
-import os
 import re
-import uuid
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -121,7 +118,7 @@ def _loose_json(text: Optional[str]) -> Any:
 
 
 # ---------------------------------------------------------------------------------------------------
-# Sarvam AI (optional, Indian languages + voice notes)
+# Sarvam AI (optional, Indian languages)
 # ---------------------------------------------------------------------------------------------------
 
 class SarvamClient:
@@ -178,28 +175,6 @@ class SarvamClient:
         out = self._post_json("/text-lid", {"input": text[:1000]})
         return by_sarvam_code(out.get("language_code"))
 
-    # -- speech --
-    def transcribe(self, file_path: str) -> tuple[str, Optional[Language]]:
-        boundary = uuid.uuid4().hex
-        filename = os.path.basename(file_path) or "voice.ogg"
-        mime = mimetypes.guess_type(filename)[0] or "audio/ogg"
-        with open(file_path, "rb") as fh:
-            audio = fh.read()
-        parts = [
-            _form_field(boundary, "language_code", "unknown"),
-            (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
-             f"Content-Type: {mime}\r\n\r\n").encode("utf-8") + audio + b"\r\n",
-            f"--{boundary}--\r\n".encode("utf-8"),
-        ]
-        out = self._post("/speech-to-text", b"".join(parts), f"multipart/form-data; boundary={boundary}")
-        transcript = out.get("transcript")
-        if not isinstance(transcript, str):
-            raise TranslationError("Sarvam returned no transcript")
-        return transcript.strip(), by_sarvam_code(out.get("language_code"))
-
-
-def _form_field(boundary: str, name: str, value: str) -> bytes:
-    return f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode("utf-8")
 
 
 # ---------------------------------------------------------------------------------------------------
